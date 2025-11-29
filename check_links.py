@@ -32,7 +32,6 @@ class YandexDirectClient:
                 timeout=self.api_timeout,
             )
         except requests.RequestException as exc:
-            # Любая сетевая ошибка к API — в осмысленный RuntimeError
             raise RuntimeError(f"Ошибка сети при запросе {service}.{method}: {exc}") from exc
 
         response.raise_for_status()
@@ -53,6 +52,10 @@ class YandexDirectClient:
             yield int(campaign["Id"]), campaign.get("Name", "")
 
     def iter_ads(self, campaign_id: int) -> Iterable[Dict]:
+        """
+        Итерация по объявлениям кампании.
+        Архивные объявления (State == 'ARCHIVED') вообще не проверяем.
+        """
         params: Dict[str, object] = {
             "SelectionCriteria": {"CampaignIds": [campaign_id]},
             "FieldNames": ["Id", "CampaignId", "State", "Status"],
@@ -65,6 +68,9 @@ class YandexDirectClient:
         while True:
             result = self._request("ads", "get", params)
             for ad in result.get("Ads", []):
+                # БЫЛО: if ad.get("Status") == "ARCHIVED":
+                if ad.get("State") == "ARCHIVED":
+                    continue
                 yield ad
 
             limited_by = result.get("LimitedBy")
@@ -85,10 +91,19 @@ def extract_urls_from_ad(ad: Dict) -> List[str]:
 
 
 def check_url(url: str, timeout: int = 10) -> Tuple[Optional[int], Optional[str]]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
     try:
-        response = requests.get(url, allow_redirects=True, timeout=timeout)
+        response = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
         return response.status_code, None
-    except requests.RequestException as exc:  # pragma: no cover - network errors depend on runtime
+    except requests.RequestException as exc:
         return None, str(exc)
 
 
@@ -139,6 +154,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
     payload = {
         "chat_id": chat_id,
         "text": text,
+        # parse_mode специально НЕ включаем, чтобы не ловить ошибки парсинга
     }
     try:
         r = requests.post(url, json=payload, timeout=10)
@@ -153,11 +169,32 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def send_telegram_document(token: str, chat_id: str, file_path: str, caption: Optional[str] = None) -> bool:
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+
+    try:
+        with open(file_path, "rb") as f:
+            files = {"document": (os.path.basename(file_path), f)}
+            r = requests.post(url, data=data, files=files, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        if not payload.get("ok"):
+            print(f"Telegram Document API error: {payload}", file=sys.stderr)
+            return False
+        return True
+    except Exception as exc:
+        print(f"Ошибка отправки документа в Telegram: {exc}", file=sys.stderr)
+        return False
+
+
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
     start_time = time.time()
 
-    # Генерируем имя файла с timestamp, если не указано вручную
+    # Генерируем имя файла с timestamp
     now_str_file = time.strftime("%Y-%m-%d_%H-%M-%S")
     base_name, ext = os.path.splitext(args.output_file)
     args.output_file = f"{base_name}_{now_str_file}{ext}"
@@ -193,6 +230,11 @@ def main(argv: List[str]) -> int:
 
                     if status == 200:
                         msg = f"  Объявление {ad_id}: ссылка {url} отвечает 200 (OK)"
+                    elif status == 403:
+                        any_issue = True
+                        err_text = f"ссылка {url} отвечает 403 (доступ запрещён для ботов, проверить вручную)"
+                        msg = f"  Объявление {ad_id}: {err_text}"
+                        issues_http[campaign_id].add(ad_id)
                     elif status is None:
                         any_issue = True
                         err_text = f"ошибка запроса {url}: {error}"
@@ -227,8 +269,8 @@ def main(argv: List[str]) -> int:
     # --- запись полного лога в файл ---
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    log_content = []
-    log_content.append(f"Отчёт проверки ссылок")
+    log_content: List[str] = []
+    log_content.append("Отчёт проверки ссылок")
     log_content.append(f"Дата и время запуска: {now_str}")
     log_content.append("")
     log_content.extend(lines)
@@ -240,62 +282,70 @@ def main(argv: List[str]) -> int:
     except Exception as e:
         print(f"Ошибка записи файла: {e}", file=sys.stderr)
 
-    # --- подготовка и отправка красивого отчёта в Telegram ---
+    # --- подготовка и отправка отчёта в Telegram ---
     if args.telegram_token and args.telegram_chat_id:
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
         if issues_http or issues_api:
-            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
             total_campaigns_http = len(issues_http)
             total_ads_http = sum(len(ads) for ads in issues_http.values())
 
             report_lines: List[str] = []
-            report_lines.append("Отчёт проверки ссылок")
-            report_lines.append(f"Время запуска: {now_str}")
+            report_lines.append(f"✨ Отчёт проверки ссылок — {now_str}")
             report_lines.append("")
-            report_lines.append("Ошибки проверки ссылок (ответ не 200):")
+            report_lines.append("❌ Ошибки найдены")
+            report_lines.append(f"📂 Кампаний с ошибками: {total_campaigns_http}")
+            report_lines.append(f"📣 Объявлений с ошибками: {total_ads_http}")
+            report_lines.append("")
 
             if issues_http:
-                report_lines.append(
-                    f"- кампаний с ошибками: {total_campaigns_http}, объявлений с ошибками: {total_ads_http}"
-                )
-                report_lines.append("")
-
+                report_lines.append("📌 Проблемные кампании:")
                 for camp_id, ad_ids in sorted(issues_http.items()):
-                    report_lines.append(f"Кампания {camp_id}:")
-                    for ad_id in sorted(ad_ids):
-                        report_lines.append(f"  - Объявление {ad_id}")
-                    report_lines.append("")
-            else:
-                report_lines.append("- HTTP-ошибок по ссылкам нет.")
+                    ad_list = ", ".join(map(str, sorted(ad_ids)))
+                    report_lines.append(f"- Кампания {camp_id}: объявления {ad_list}")
                 report_lines.append("")
 
             if issues_api:
-                report_lines.append("Ошибки API Яндекс.Директа:")
+                report_lines.append("⚠ Ошибки API Яндекс.Директа:")
                 for camp_id, err in sorted(issues_api.items()):
-                    report_lines.append(f"Кампания {camp_id}: {err}")
+                    report_lines.append(f"- Кампания {camp_id}: {err}")
                 report_lines.append("")
 
-            report_lines.append(f"Полный лог: {args.output_file}")
+            report_lines.append(f"📄 Полный лог: {args.output_file}")
 
             text = "\n".join(report_lines)
             if len(text) > 4000:
                 text = text[:3990] + "\n…обрезано, см. полный лог в файле."
 
-            sent = send_telegram_message(args.telegram_token, args.telegram_chat_id, text)
+            sent_msg = send_telegram_message(args.telegram_token, args.telegram_chat_id, text)
             print("\nКраткий отчёт:")
             print(text)
-            if sent:
+            if sent_msg:
                 print("Краткий отчёт отправлен в Telegram.")
             else:
                 print("Не удалось отправить краткий отчёт в Telegram, см. сообщение об ошибке выше.")
+
+            caption = "Полный лог проверки ссылок во вложении."
+            sent_doc = send_telegram_document(args.telegram_token, args.telegram_chat_id, args.output_file, caption)
+            if sent_doc:
+                print("Файл лога отправлен в Telegram.")
+            else:
+                print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
         else:
-            ok_text = "Отчёт проверки ссылок: все ссылки возвращают 200. Ошибок не найдено."
-            sent = send_telegram_message(args.telegram_token, args.telegram_chat_id, ok_text)
+            ok_text = f"✨ Отчёт проверки ссылок — {now_str}\n\n🟢 Ошибок не найдено. Все ссылки отвечают 200."
+            sent_msg = send_telegram_message(args.telegram_token, args.telegram_chat_id, ok_text)
             print("\nСообщение для Telegram:")
             print(ok_text)
-            if sent:
+            if sent_msg:
                 print("Сообщение об отсутствии ошибок отправлено в Telegram.")
             else:
                 print("Не удалось отправить сообщение в Telegram, см. сообщение об ошибке выше.")
+
+            caption = "Полный лог проверки ссылок (ошибок не найдено)."
+            sent_doc = send_telegram_document(args.telegram_token, args.telegram_chat_id, args.output_file, caption)
+            if sent_doc:
+                print("Файл лога отправлен в Telegram.")
+            else:
+                print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
     else:
         print("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы, отчёт в Telegram не отправлен.")
 
