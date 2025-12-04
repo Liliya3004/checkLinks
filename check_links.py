@@ -4,6 +4,7 @@ import sys
 from typing import Dict, Iterable, List, Optional, Tuple
 import time
 from collections import defaultdict
+from urllib.parse import urlparse
 
 import requests
 
@@ -22,6 +23,15 @@ HTTP_STATUS_DESCRIPTIONS: Dict[int, str] = {
     503: "сервис временно недоступен",
     504: "шлюз не отвечает",
 }
+
+# Домены-заглушки партнёрских сетей
+STUB_DOMAINS = {
+    "bankpro.su",
+    "tb.gdeslon.ru",
+}
+
+STUB_ADMITAD_HOST = "offerwall.admitad.com"
+STUB_ADMITAD_PATH_PREFIX = "/wall/offers"
 
 
 class YandexDirectClient:
@@ -105,7 +115,12 @@ def extract_urls_from_ad(ad: Dict) -> List[str]:
     return urls
 
 
-def check_url(url: str, timeout: int = 10) -> Tuple[Optional[int], Optional[str]]:
+def check_url(url: str, timeout: int = 10) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Возвращает (status_code, error_text, final_url).
+
+    final_url — итоговый URL после всех редиректов (нужен для проверки заглушек).
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -117,9 +132,9 @@ def check_url(url: str, timeout: int = 10) -> Tuple[Optional[int], Optional[str]
     }
     try:
         response = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
-        return response.status_code, None
+        return response.status_code, None, response.url
     except requests.RequestException as exc:
-        return None, str(exc)
+        return None, str(exc), None
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -205,6 +220,26 @@ def send_telegram_document(token: str, chat_id: str, file_path: str, caption: Op
         return False
 
 
+def is_stub_final_url(final_url: Optional[str]) -> bool:
+    """
+    Возвращает True, если итоговый URL ведёт на заглушку партнёрской сети.
+    """
+    if not final_url:
+        return False
+
+    parsed = urlparse(final_url)
+    host = parsed.netloc.lower()
+    path = parsed.path or "/"
+
+    if host in STUB_DOMAINS:
+        return True
+
+    if host == STUB_ADMITAD_HOST and path.startswith(STUB_ADMITAD_PATH_PREFIX):
+        return True
+
+    return False
+
+
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
     start_time = time.time()
@@ -229,8 +264,8 @@ def main(argv: List[str]) -> int:
 
     # HTTP-ошибки по ссылкам:
     # кампания_id -> список проблем:
-    # (ad_id, url, status_code_or_None, error_text_or_None)
-    issues_http: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
+    # (ad_id, url, status_code_or_None, description_or_error_text, is_stub)
+    issues_http: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
     # Ошибки API по кампаниям
     issues_api: Dict[int, str] = {}
 
@@ -243,24 +278,39 @@ def main(argv: List[str]) -> int:
             for ad in client.iter_ads(campaign_id):
                 ad_id = int(ad.get("Id"))
                 for url in extract_urls_from_ad(ad):
-                    status, error = check_url(url, timeout=args.timeout)
+                    status, error, final_url = check_url(url, timeout=args.timeout)
+                    stub = is_stub_final_url(final_url)
 
-                    if status is not None and 200 <= status < 300:
-                        # Любой 2xx считаем ОК (включая 202 и т.п.)
+                    if status is not None and 200 <= status < 300 and not stub:
+                        # Любой 2xx считаем ОК, если это не заглушка партнёрской сети.
                         msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} (OK)"
+                        print(msg)
+                        lines.append(msg)
+                        continue
+
+                    # Всё остальное — ошибка
+                    any_issue = True
+
+                    if stub:
+                        desc = "переход на заглушку партнёрской сети"
+                        msg = (
+                            f"  Объявление {ad_id}: ссылка {url} ведёт на {final_url} "
+                            f"({desc})"
+                        )
+                        issues_http[campaign_id].append((ad_id, url, status, desc, True))
                     elif status is None:
-                        any_issue = True
-                        err_text = f"ошибка запроса {error}" if error else "ошибка запроса, подробности отсутствуют"
-                        msg = f"  Объявление {ad_id}: ссылка {url}: {err_text}"
-                        issues_http[campaign_id].append((ad_id, url, None, err_text))
+                        desc = error or "ошибка запроса, подробности отсутствуют"
+                        msg = f"  Объявление {ad_id}: ссылка {url}: {desc}"
+                        issues_http[campaign_id].append((ad_id, url, None, desc, False))
                     else:
-                        any_issue = True
-                        desc = HTTP_STATUS_DESCRIPTIONS.get(status)
-                        if desc:
-                            msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} ({desc})"
+                        base_desc = HTTP_STATUS_DESCRIPTIONS.get(status)
+                        if base_desc:
+                            desc = base_desc
+                            msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} ({base_desc})"
                         else:
+                            desc = None
                             msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status}"
-                        issues_http[campaign_id].append((ad_id, url, status, desc))
+                        issues_http[campaign_id].append((ad_id, url, status, desc, False))
 
                     print(msg)
                     lines.append(msg)
@@ -274,9 +324,9 @@ def main(argv: List[str]) -> int:
             issues_api[campaign_id] = err_text
 
     summary_line = (
-        "Найдены ссылки с отличным от 2xx ответом."
+        "Найдены ссылки с отличным от 2xx ответом или ведущие на заглушку."
         if any_issue
-        else "Все ссылки возвращают 2xx."
+        else "Все ссылки возвращают 2xx и не ведут на заглушки."
     )
     print(summary_line)
     lines.append(summary_line)
@@ -304,89 +354,121 @@ def main(argv: List[str]) -> int:
             total_campaigns_http = len(issues_http)
             total_ads_http = sum(len(ads) for ads in issues_http.values())
 
-            report_lines: List[str] = []
-            report_lines.append(f"✨ Отчёт проверки ссылок — {now_str}")
-            report_lines.append("")
-            report_lines.append("❌ Ошибки найдены")
-            report_lines.append(f"📂 Кампаний с ошибками: {total_campaigns_http}")
-            report_lines.append(f"📣 Объявлений с ошибками: {total_ads_http}")
-            report_lines.append("")
+            # Разбиваем проблемы на группы:
+            group_stub: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
+            group_404: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
+            group_other: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
+            group_no_code: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
 
-            if issues_http:
-                # Группируем проблемы по типам: 404, другие коды, без кода (ошибка сети и т.п.)
-                group_404: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
-                group_other: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
-                group_no_code: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
+            for camp_id, problems in issues_http.items():
+                for ad_id, url, status_code, desc, stub in problems:
+                    if stub:
+                        group_stub[camp_id].append((ad_id, url, status_code, desc, stub))
+                    elif status_code is None:
+                        group_no_code[camp_id].append((ad_id, url, status_code, desc, stub))
+                    elif status_code == 404:
+                        group_404[camp_id].append((ad_id, url, status_code, desc, stub))
+                    else:
+                        group_other[camp_id].append((ad_id, url, status_code, desc, stub))
 
-                for camp_id, problems in issues_http.items():
-                    for ad_id, url, status_code, err_text in problems:
-                        if status_code is None:
-                            group_no_code[camp_id].append((ad_id, url, status_code, err_text))
-                        elif status_code == 404:
-                            group_404[camp_id].append((ad_id, url, status_code, err_text))
-                        else:
-                            group_other[camp_id].append((ad_id, url, status_code, err_text))
+            # --- 1. Основное сообщение (для Lemur) ---
+            main_lines: List[str] = []
+            main_lines.append(f"✨ Отчёт проверки ссылок — {now_str}")
+            main_lines.append("")
+            main_lines.append("❌ Ошибки найдены")
+            main_lines.append(f"📂 Кампаний с ошибками: {total_campaigns_http}")
+            main_lines.append(f"📣 Объявлений с ошибками: {total_ads_http}")
+            main_lines.append("")
 
-                report_lines.append("📌 Проблемные кампании:")
+            if group_stub:
+                main_lines.append("🟣 Переход на заглушку партнёрской сети:")
+                for camp_id, problems in sorted(group_stub.items()):
+                    main_lines.append(f"- Кампания {camp_id}:")
+                    for ad_id, url, status_code, desc, _stub in problems:
+                        main_lines.append(
+                            f"  • Объявление {ad_id}: ссылка {url} ведёт на заглушку ({desc})."
+                        )
+                    main_lines.append("")
 
-                if group_404:
-                    report_lines.append("🔴 Ответ 404 (страница не найдена):")
-                    for camp_id, problems in sorted(group_404.items()):
-                        report_lines.append(f"- Кампания {camp_id}:")
-                        for ad_id, url, status_code, err_text in problems:
-                            report_lines.append(
-                                f"  • Объявление {ad_id}: ссылка {url} отвечает 404 (страница не найдена)."
-                            )
-                        report_lines.append("")
+            if group_404:
+                main_lines.append("🔴 Ответ 404 (страница не найдена):")
+                for camp_id, problems in sorted(group_404.items()):
+                    main_lines.append(f"- Кампания {camp_id}:")
+                    for ad_id, url, status_code, desc, _stub in problems:
+                        main_lines.append(
+                            f"  • Объявление {ad_id}: ссылка {url} отвечает 404 (страница не найдена)."
+                        )
+                    main_lines.append("")
 
-                if group_other:
-                    report_lines.append("🟠 Другие коды ошибок:")
-                    for camp_id, problems in sorted(group_other.items()):
-                        report_lines.append(f"- Кампания {camp_id}:")
-                        for ad_id, url, status_code, err_text in problems:
-                            code_str = str(status_code) if status_code is not None else "?"
-                            desc = err_text or HTTP_STATUS_DESCRIPTIONS.get(status_code, "")
-                            if desc:
-                                report_lines.append(
-                                    f"  • Объявление {ad_id}: ссылка {url} отвечает {code_str} ({desc})."
-                                )
-                            else:
-                                report_lines.append(
-                                    f"  • Объявление {ad_id}: ссылка {url} отвечает {code_str}."
-                                )
-                        report_lines.append("")
-
-                if group_no_code:
-                    report_lines.append("⚪ Код не получен (проверьте вручную):")
-                    for camp_id, problems in sorted(group_no_code.items()):
-                        report_lines.append(f"- Кампания {camp_id}:")
-                        for ad_id, url, status_code, err_text in problems:
-                            text_err = err_text or "код не получен, проверьте вручную"
-                            report_lines.append(
-                                f"  • Объявление {ad_id}: ссылка {url} — {text_err}."
-                            )
-                        report_lines.append("")
+            if group_no_code:
+                main_lines.append("⚪ Код не получен (проверьте вручную):")
+                for camp_id, problems in sorted(group_no_code.items()):
+                    main_lines.append(f"- Кампания {camp_id}:")
+                    for ad_id, url, status_code, desc, _stub in problems:
+                        text_err = desc or "код не получен, проверьте вручную"
+                        main_lines.append(
+                            f"  • Объявление {ad_id}: ссылка {url} — {text_err}."
+                        )
+                    main_lines.append("")
 
             if issues_api:
-                report_lines.append("⚠ Ошибки API Яндекс.Директа:")
+                main_lines.append("⚠ Ошибки API Яндекс.Директа:")
                 for camp_id, err in sorted(issues_api.items()):
-                    report_lines.append(f"- Кампания {camp_id}: {err}")
-                report_lines.append("")
+                    main_lines.append(f"- Кампания {camp_id}: {err}")
+                main_lines.append("")
 
-            report_lines.append(f"📄 Полный лог: {args.output_file}")
+            main_lines.append(f"📄 Полный лог: {args.output_file}")
 
-            text = "\n".join(report_lines)
-            if len(text) > 4000:
-                text = text[:3990] + "\n…обрезано, см. полный лог в файле."
+            main_text = "\n".join(main_lines)
+            if len(main_text) > 4000:
+                main_text = main_text[:3990] + "\n…обрезано, см. полный лог в файле."
 
-            sent_msg = send_telegram_message(args.telegram_token, args.telegram_chat_id, text)
-            print("\nКраткий отчёт:")
-            print(text)
-            if sent_msg:
-                print("Краткий отчёт отправлен в Telegram.")
+            sent_main = send_telegram_message(args.telegram_token, args.telegram_chat_id, main_text)
+            print("\nОсновной отчёт:")
+            print(main_text)
+            if sent_main:
+                print("Основной отчёт отправлен в Telegram.")
             else:
-                print("Не удалось отправить краткий отчёт в Telegram, см. сообщение об ошибке выше.")
+                print("Не удалось отправить основной отчёт в Telegram, см. сообщение об ошибке выше.")
 
+            # --- 2. Доп. сообщение с «другими кодами» (для тебя) ---
+            if group_other:
+                extra_lines: List[str] = []
+                extra_lines.append(
+                    "Строка для Lemur: тебе достаточно предыдущего сообщения, это доп. детали по другим кодам."
+                )
+                extra_lines.append("")
+                extra_lines.append("🟠 Дополнительные ошибки (другие коды HTTP):")
+                extra_lines.append(f"📂 Кампаний с такими ошибками: {len(group_other)}")
+                extra_lines.append("")
+
+                for camp_id, problems in sorted(group_other.items()):
+                    extra_lines.append(f"- Кампания {camp_id}:")
+                    for ad_id, url, status_code, desc, _stub in problems:
+                        code_str = str(status_code) if status_code is not None else "?"
+                        if desc:
+                            extra_lines.append(
+                                f"  • Объявление {ad_id}: ссылка {url} отвечает {code_str} ({desc})."
+                            )
+                        else:
+                            extra_lines.append(
+                                f"  • Объявление {ad_id}: ссылка {url} отвечает {code_str}."
+                            )
+                    extra_lines.append("")
+
+                extra_text = "\n".join(extra_lines)
+                if len(extra_text) > 4000:
+                    extra_text = extra_text[:3990] + "\n…обрезано, см. полный лог в файле."
+
+                sent_extra = send_telegram_message(args.telegram_token, args.telegram_chat_id, extra_text)
+                print("\nДополнительный отчёт (другие коды):")
+                print(extra_text)
+                if sent_extra:
+                    print("Дополнительный отчёт отправлен в Telegram.")
+                else:
+                    print("Не удалось отправить дополнительный отчёт в Telegram, см. сообщение об ошибке выше.")
+
+            # --- 3. Лог файлом ---
             caption = "Полный лог проверки ссылок во вложении."
             sent_doc = send_telegram_document(args.telegram_token, args.telegram_chat_id, args.output_file, caption)
             if sent_doc:
@@ -394,7 +476,7 @@ def main(argv: List[str]) -> int:
             else:
                 print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
         else:
-            ok_text = f"✨ Отчёт проверки ссылок — {now_str}\n\n🟢 Ошибок не найдено. Все ссылки отвечают 2xx."
+            ok_text = f"✨ Отчёт проверки ссылок — {now_str}\n\n🟢 Ошибок не найдено. Все ссылки отвечают 2xx и не ведут на заглушки."
             sent_msg = send_telegram_message(args.telegram_token, args.telegram_chat_id, ok_text)
             print("\nСообщение для Telegram:")
             print(ok_text)
