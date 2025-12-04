@@ -1,13 +1,27 @@
 import argparse
 import os
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple, Set
+from typing import Dict, Iterable, List, Optional, Tuple
 import time
 from collections import defaultdict
 
 import requests
 
 API_URL_BASE = "https://api.direct.yandex.com/json/v5"
+
+
+# Описания для наиболее частых кодов ошибок
+HTTP_STATUS_DESCRIPTIONS: Dict[int, str] = {
+    400: "неверный запрос",
+    401: "требуется авторизация",
+    403: "доступ запрещён (часто блокировка ботов)",
+    404: "страница не найдена",
+    429: "слишком много запросов",
+    500: "внутренняя ошибка сервера",
+    502: "ошибочный шлюз",
+    503: "сервис временно недоступен",
+    504: "шлюз не отвечает",
+}
 
 
 class YandexDirectClient:
@@ -54,7 +68,7 @@ class YandexDirectClient:
     def iter_ads(self, campaign_id: int) -> Iterable[Dict]:
         """
         Итерация по объявлениям кампании.
-        Архивные объявления (State == 'ARCHIVED') вообще не проверяем.
+        Проверяем только объявления в состоянии ON (не трогаем ARCHIVED, OFF и т.д.).
         """
         params: Dict[str, object] = {
             "SelectionCriteria": {"CampaignIds": [campaign_id]},
@@ -69,11 +83,9 @@ class YandexDirectClient:
             result = self._request("ads", "get", params)
             for ad in result.get("Ads", []):
                 state = ad.get("State")
-
-                # Проверяем только активные объявления
+                # Только реально крутящиеся объявления
                 if state != "ON":
                     continue
-
                 yield ad
 
             limited_by = result.get("LimitedBy")
@@ -215,8 +227,10 @@ def main(argv: List[str]) -> int:
     any_issue = False
     lines: List[str] = []  # полный лог для файла
 
-    # HTTP-ошибки по ссылкам: кампания -> множество объявлений
-    issues_http: Dict[int, Set[int]] = defaultdict(set)
+    # HTTP-ошибки по ссылкам:
+    # кампания_id -> список проблем:
+    # (ad_id, url, status_code_or_None, error_text_or_None)
+    issues_http: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
     # Ошибки API по кампаниям
     issues_api: Dict[int, str] = {}
 
@@ -231,23 +245,22 @@ def main(argv: List[str]) -> int:
                 for url in extract_urls_from_ad(ad):
                     status, error = check_url(url, timeout=args.timeout)
 
-                    if status == 200:
-                        msg = f"  Объявление {ad_id}: ссылка {url} отвечает 200 (OK)"
-                    elif status == 403:
-                        any_issue = True
-                        err_text = f"ссылка {url} отвечает 403 (доступ запрещён для ботов, проверить вручную)"
-                        msg = f"  Объявление {ad_id}: {err_text}"
-                        issues_http[campaign_id].add(ad_id)
+                    if status is not None and 200 <= status < 300:
+                        # Любой 2xx считаем ОК (включая 202 и т.п.)
+                        msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} (OK)"
                     elif status is None:
                         any_issue = True
-                        err_text = f"ошибка запроса {url}: {error}"
-                        msg = f"  Объявление {ad_id}: {err_text}"
-                        issues_http[campaign_id].add(ad_id)
+                        err_text = f"ошибка запроса {error}" if error else "ошибка запроса, подробности отсутствуют"
+                        msg = f"  Объявление {ad_id}: ссылка {url}: {err_text}"
+                        issues_http[campaign_id].append((ad_id, url, None, err_text))
                     else:
                         any_issue = True
-                        err_text = f"ссылка {url} отвечает {status}"
-                        msg = f"  Объявление {ad_id}: {err_text}"
-                        issues_http[campaign_id].add(ad_id)
+                        desc = HTTP_STATUS_DESCRIPTIONS.get(status)
+                        if desc:
+                            msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} ({desc})"
+                        else:
+                            msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status}"
+                        issues_http[campaign_id].append((ad_id, url, status, desc))
 
                     print(msg)
                     lines.append(msg)
@@ -259,12 +272,11 @@ def main(argv: List[str]) -> int:
             print(msg)
             lines.append(msg)
             issues_api[campaign_id] = err_text
-            # переходим к следующей кампании
 
     summary_line = (
-        "Найдены ссылки с отличным от 200 ответом."
+        "Найдены ссылки с отличным от 2xx ответом."
         if any_issue
-        else "Все ссылки возвращают 200."
+        else "Все ссылки возвращают 2xx."
     )
     print(summary_line)
     lines.append(summary_line)
@@ -301,11 +313,59 @@ def main(argv: List[str]) -> int:
             report_lines.append("")
 
             if issues_http:
+                # Группируем проблемы по типам: 404, другие коды, без кода (ошибка сети и т.п.)
+                group_404: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
+                group_other: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
+                group_no_code: Dict[int, List[Tuple[int, str, Optional[int], Optional[str]]]] = defaultdict(list)
+
+                for camp_id, problems in issues_http.items():
+                    for ad_id, url, status_code, err_text in problems:
+                        if status_code is None:
+                            group_no_code[camp_id].append((ad_id, url, status_code, err_text))
+                        elif status_code == 404:
+                            group_404[camp_id].append((ad_id, url, status_code, err_text))
+                        else:
+                            group_other[camp_id].append((ad_id, url, status_code, err_text))
+
                 report_lines.append("📌 Проблемные кампании:")
-                for camp_id, ad_ids in sorted(issues_http.items()):
-                    ad_list = ", ".join(map(str, sorted(ad_ids)))
-                    report_lines.append(f"- Кампания {camp_id}: объявления {ad_list}")
-                report_lines.append("")
+
+                if group_404:
+                    report_lines.append("🔴 Ответ 404 (страница не найдена):")
+                    for camp_id, problems in sorted(group_404.items()):
+                        report_lines.append(f"- Кампания {camp_id}:")
+                        for ad_id, url, status_code, err_text in problems:
+                            report_lines.append(
+                                f"  • Объявление {ad_id}: ссылка {url} отвечает 404 (страница не найдена)."
+                            )
+                        report_lines.append("")
+
+                if group_other:
+                    report_lines.append("🟠 Другие коды ошибок:")
+                    for camp_id, problems in sorted(group_other.items()):
+                        report_lines.append(f"- Кампания {camp_id}:")
+                        for ad_id, url, status_code, err_text in problems:
+                            code_str = str(status_code) if status_code is not None else "?"
+                            desc = err_text or HTTP_STATUS_DESCRIPTIONS.get(status_code, "")
+                            if desc:
+                                report_lines.append(
+                                    f"  • Объявление {ad_id}: ссылка {url} отвечает {code_str} ({desc})."
+                                )
+                            else:
+                                report_lines.append(
+                                    f"  • Объявление {ad_id}: ссылка {url} отвечает {code_str}."
+                                )
+                        report_lines.append("")
+
+                if group_no_code:
+                    report_lines.append("⚪ Код не получен (проверьте вручную):")
+                    for camp_id, problems in sorted(group_no_code.items()):
+                        report_lines.append(f"- Кампания {camp_id}:")
+                        for ad_id, url, status_code, err_text in problems:
+                            text_err = err_text or "код не получен, проверьте вручную"
+                            report_lines.append(
+                                f"  • Объявление {ad_id}: ссылка {url} — {text_err}."
+                            )
+                        report_lines.append("")
 
             if issues_api:
                 report_lines.append("⚠ Ошибки API Яндекс.Директа:")
@@ -334,7 +394,7 @@ def main(argv: List[str]) -> int:
             else:
                 print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
         else:
-            ok_text = f"✨ Отчёт проверки ссылок — {now_str}\n\n🟢 Ошибок не найдено. Все ссылки отвечают 200."
+            ok_text = f"✨ Отчёт проверки ссылок — {now_str}\n\n🟢 Ошибок не найдено. Все ссылки отвечают 2xx."
             sent_msg = send_telegram_message(args.telegram_token, args.telegram_chat_id, ok_text)
             print("\nСообщение для Telegram:")
             print(ok_text)
@@ -353,13 +413,20 @@ def main(argv: List[str]) -> int:
         print("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы, отчёт в Telegram не отправлен.")
 
     duration = time.time() - start_time
-    print(f"Время выполнения программы: {duration:.2f} сек.")
+    minutes = int(duration // 60)
+    seconds = int(duration % 60)
+    if minutes > 0:
+        duration_str = f"{minutes} мин {seconds} сек"
+    else:
+        duration_str = f"{seconds} сек"
+
+    print(f"Время выполнения программы: {duration_str}")
     finish_str = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         with open(args.output_file, "a", encoding="utf-8") as f:
             f.write("\n")
             f.write(f"Дата и время окончания: {finish_str}\n")
-            f.write(f"Время выполнения: {duration:.2f} сек.\n")
+            f.write(f"Время выполнения: {duration_str}\n")
     except Exception as e:
         print(f"Ошибка записи завершения лога: {e}", file=sys.stderr)
     return 0
