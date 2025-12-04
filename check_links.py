@@ -68,9 +68,12 @@ class YandexDirectClient:
         while True:
             result = self._request("ads", "get", params)
             for ad in result.get("Ads", []):
-                # БЫЛО: if ad.get("Status") == "ARCHIVED":
-                if ad.get("State") == "ARCHIVED":
+                state = ad.get("State")
+
+                # Проверяем только активные объявления
+                if state != "ON":
                     continue
+
                 yield ad
 
             limited_by = result.get("LimitedBy")
