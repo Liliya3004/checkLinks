@@ -136,10 +136,41 @@ def extract_client_redirect_url(html: str, base_url: str) -> Optional[str]:
     return None
 
 
-def check_url_verbose(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+# def check_url_verbose(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+#     """
+#     Возвращает (status_code, error_text, final_url, html_text).
+#     html_text будет только для HTML-ответов, иначе None.
+#     """
+#     headers = {
+#         "User-Agent": (
+#             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+#             "AppleWebKit/537.36 (KHTML, like Gecko) "
+#             "Chrome/124.0.0.0 Safari/537.36"
+#         ),
+#         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+#         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+#     }
+#     try:
+#         r = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+#         content_type = (r.headers.get("Content-Type") or "").lower()
+#         html = r.text if "text/html" in content_type else None
+#         return r.status_code, None, r.url, html
+#     except requests.RequestException as exc:
+#         return None, str(exc), None, None
+def check_url_verbose(
+    url: str,
+    timeout: int = 120,
+    connect_timeout: int = 10,
+    read_timeout: int = 20,
+    max_html_bytes: int = 256_000,
+) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     """
     Возвращает (status_code, error_text, final_url, html_text).
-    html_text будет только для HTML-ответов, иначе None.
+
+    Улучшения:
+    - timeout разделён на connect/read (меньше ложных Read timed out)
+    - stream=True: не скачиваем тело целиком (быстрее и стабильнее)
+    - при HTML читаем только первые max_html_bytes байт (достаточно для редиректов)
     """
     headers = {
         "User-Agent": (
@@ -149,15 +180,45 @@ def check_url_verbose(url: str, timeout: int = 120) -> Tuple[Optional[int], Opti
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "close",
     }
+
+    # Если timeout передали числом, используем его как read_timeout по умолчанию.
+    # (Совместимость с вашим текущим вызовом check_url(..., timeout=args.timeout))
+    if isinstance(timeout, int):
+        read_timeout = max(read_timeout, timeout)
+
     try:
-        r = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+        r = requests.get(
+            url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=(connect_timeout, read_timeout),
+            stream=True,
+        )
+
+        final_url = r.url
+        status = r.status_code
         content_type = (r.headers.get("Content-Type") or "").lower()
-        html = r.text if "text/html" in content_type else None
-        return r.status_code, None, r.url, html
+
+        html: Optional[str] = None
+        if "text/html" in content_type:
+            # читаем ограниченный объём, чтобы не ждать огромную/подвисшую страницу
+            raw = b""
+            for chunk in r.iter_content(chunk_size=32_768):
+                if not chunk:
+                    break
+                raw += chunk
+                if len(raw) >= max_html_bytes:
+                    break
+            # стараемся декодировать корректно
+            encoding = r.encoding or "utf-8"
+            html = raw.decode(encoding, errors="replace")
+
+        return status, None, final_url, html
+
     except requests.RequestException as exc:
         return None, str(exc), None, None
-
 
 def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     status, error, final_url, html = check_url_verbose(url, timeout=timeout)
@@ -324,6 +385,28 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Вывести список активных кампаний (Id + Name) и завершить работу.",
     )
     return parser.parse_args(argv)
+
+
+def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
+    """
+    Делит длинный текст на части, безопасные для Telegram.
+    Деление идёт по строкам, чтобы не резать текст посередине.
+    """
+    parts: List[str] = []
+    current = ""
+
+    for line in text.splitlines():
+        # +1 на перевод строки
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current.rstrip())
+            current = line + "\n"
+        else:
+            current += line + "\n"
+
+    if current.strip():
+        parts.append(current.rstrip())
+
+    return parts
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
@@ -696,11 +779,25 @@ def main(argv: List[str]) -> int:
                 if len(extra_text) > 4000:
                     extra_text = extra_text[:3990] + "\n…обрезано, см. полный лог в файле."
 
-                sent_extra = send_telegram_message(args.telegram_token, detail_chat_id, extra_text)
                 print("\nДополнительный отчёт (другие коды):")
                 print(extra_text)
-                if sent_extra:
-                    print("Дополнительный отчёт отправлен в Telegram.")
+
+                parts = split_telegram_text(extra_text)
+
+                all_sent = True
+                for idx, part in enumerate(parts, start=1):
+                    header = f"Доп. отчёт (часть {idx}/{len(parts)})\n"
+                    sent = send_telegram_message(
+                        args.telegram_token,
+                        detail_chat_id,
+                        header + part
+                    )
+                    if not sent:
+                        all_sent = False
+                        break
+
+                if all_sent:
+                    print(f"Дополнительный отчёт отправлен в Telegram ({len(parts)} частей).")
                 else:
                     print("Не удалось отправить дополнительный отчёт в Telegram, см. сообщение об ошибке выше.")
 
@@ -819,45 +916,16 @@ python3 check_links.py \
   --campaign-ids 704059435,704059999
 
 ------------------------------------------------------------------------------
-3. ПРОВЕРКА С ПОВТОРНОЙ ПРОВЕРКОЙ (ANTI-JS / TIMER REDIRECTS)
+3. РЕЖИМЫ БЕЗ TELEGRAM (ЛОКАЛЬНЫЕ ПРОГОНЫ)
 ------------------------------------------------------------------------------
 
-3.1. Повторная проверка ВСЕХ ссылок:
-     2 попытки, между ними 7 секунд
-python3 check_links.py \
-  --token "..." \
-  --client-login "..." \
-  --recheck-delay 7 \
-  --recheck-attempts 2
-
-3.2. Повторная проверка только для партнёрских доменов
-python3 check_links.py \
-  --token "..." \
-  --client-login "..." \
-  --recheck-delay 7 \
-  --recheck-attempts 2 \
-  --recheck-only-domains "ad.admitad.com,offerwall.admitad.com,tb.gdeslon.ru,bankpro.su"
-
-3.3. Тест одной кампании + повторная проверка партнёрских ссылок
-python3 check_links.py \
-  --token "..." \
-  --client-login "..." \
-  --campaign-id 704059435 \
-  --recheck-delay 7 \
-  --recheck-attempts 2 \
-  --recheck-only-domains "ad.admitad.com"
-
-------------------------------------------------------------------------------
-4. РЕЖИМЫ БЕЗ TELEGRAM (ЛОКАЛЬНЫЕ ПРОГОНЫ)
-------------------------------------------------------------------------------
-
-4.1. Telegram отключён автоматически, если не передавать параметры
+3.1. Telegram отключён автоматически, если не передавать параметры
 python3 check_links.py \
   --token "..." \
   --client-login "..." \
   --campaign-id 704059435
 
-4.2. Явное отключение Telegram (если добавлен флаг --no-telegram)
+3.2. Явное отключение Telegram (если добавлен флаг --no-telegram)
 python3 check_links.py \
   --token "..." \
   --client-login "..." \
@@ -865,7 +933,7 @@ python3 check_links.py \
   --no-telegram
 
 ------------------------------------------------------------------------------
-5. ВСПОМОГАТЕЛЬНЫЕ ПАРАМЕТРЫ
+4. ВСПОМОГАТЕЛЬНЫЕ ПАРАМЕТРЫ
 ------------------------------------------------------------------------------
 
 --timeout N
@@ -879,15 +947,6 @@ python3 check_links.py \
 
 --output-file name.txt
   Базовое имя файла отчёта (реальный файл создаётся в папке _logs)
-
-------------------------------------------------------------------------------
-ПРИМЕЧАНИЯ
-------------------------------------------------------------------------------
-• Повторная проверка полезна для ссылок с JS / countdown редиректами.
-• Финальный результат берётся по ПОСЛЕДНЕЙ попытке проверки.
-• Если кампания указана, но не активна (не ON + ACCEPTED) —
-  будет выведено предупреждение.
-• Логи всегда сохраняются локально, даже если Telegram отключён.
 
 ===============================================================================
 """
