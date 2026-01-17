@@ -7,6 +7,8 @@ from collections import defaultdict
 from urllib.parse import urlparse
 
 import requests
+import re
+from urllib.parse import urljoin
 
 API_URL_BASE = "https://api.direct.yandex.com/json/v5"
 
@@ -31,6 +33,17 @@ STUB_DOMAINS = {
 
 STUB_ADMITAD_HOST = "offerwall.admitad.com"
 STUB_ADMITAD_PATH_PREFIX = "/wall/offers"
+
+CLIENT_REDIRECT_PATTERNS = [
+    # meta refresh: <meta http-equiv="refresh" content="3; url=https://...">
+    re.compile(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\']?[^"\']*url=([^"\'>\s]+)', re.I),
+    # location.href = "..."
+    re.compile(r'location\.href\s*=\s*["\']([^"\']+)["\']', re.I),
+    # window.location = "..."
+    re.compile(r'window\.location\s*=\s*["\']([^"\']+)["\']', re.I),
+    # location.replace("...")
+    re.compile(r'location\.replace\(\s*["\']([^"\']+)["\']\s*\)', re.I),
+]
 
 
 class YandexDirectClient:
@@ -106,24 +119,27 @@ class YandexDirectClient:
                 break
             params["Page"]["Offset"] = limited_by
 
+def extract_client_redirect_url(html: str, base_url: str) -> Optional[str]:
+    if not html:
+        return None
 
-def extract_urls_from_ad(ad: Dict) -> List[str]:
-    """Достаёт Href из разных типов объявлений (TextAd, DynamicTextAd, TextAdBuilderAd)."""
-    urls: List[str] = []
-    for key in ("TextAd", "DynamicTextAd", "TextAdBuilderAd"):
-        sub = ad.get(key)
-        if sub:
-            href = sub.get("Href")
-            if href:
-                urls.append(href)
-    return urls
+    for pat in CLIENT_REDIRECT_PATTERNS:
+        m = pat.search(html)
+        if not m:
+            continue
+        target = m.group(1).strip()
+        if not target:
+            continue
+        # поддержим относительные ссылки
+        return urljoin(base_url, target)
+
+    return None
 
 
-def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+def check_url_verbose(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     """
-    Делает GET по ссылке с редиректами, возвращает (status_code, error_text, final_url),
-    final_url — итоговый URL после всех редиректов (нужен для проверки заглушек);
-    при ошибке — status_code=None.
+    Возвращает (status_code, error_text, final_url, html_text).
+    html_text будет только для HTML-ответов, иначе None.
     """
     headers = {
         "User-Agent": (
@@ -135,74 +151,56 @@ def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     try:
-        response = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
-        return response.status_code, None, response.url
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        html = r.text if "text/html" in content_type else None
+        return r.status_code, None, r.url, html
     except requests.RequestException as exc:
-        return None, str(exc), None
+        return None, str(exc), None, None
 
 
-def _normalize_host(host: str) -> str:
-    host = (host or "").strip().lower()
-    if host.startswith("www."):
-        host = host[4:]
-    return host
+def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    status, error, final_url, html = check_url_verbose(url, timeout=timeout)
 
+    # если получили HTML и 200 — попробуем вытащить client-side redirect
+    if status == 200 and html and final_url:
+        client_target = extract_client_redirect_url(html, base_url=final_url)
+        if client_target:
+            # возвращаем "финал", который увидит пользователь после таймера/JS
+            return status, error, client_target
 
-def should_recheck(url: str, domains_csv: str) -> bool:
-    """
-    Если domains_csv пуст — повторяем для всех URL.
-    Если задан — повторяем только для доменов из списка.
-    """
-    if not domains_csv.strip():
-        return True
+    return status, error, final_url
+# def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+#     """
+#     Делает GET по ссылке с редиректами, возвращает (status_code, error_text, final_url),
+#     final_url — итоговый URL после всех редиректов (нужен для проверки заглушек);
+#     при ошибке — status_code=None.
+#     """
+#     headers = {
+#         "User-Agent": (
+#             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+#             "AppleWebKit/537.36 (KHTML, like Gecko) "
+#             "Chrome/124.0.0.0 Safari/537.36"
+#         ),
+#         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+#         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+#     }
+#     try:
+#         response = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
+#         return response.status_code, None, response.url
+#     except requests.RequestException as exc:
+#         return None, str(exc), None
 
-    allowed = {_normalize_host(x) for x in domains_csv.split(",") if x.strip()}
-    try:
-        host = _normalize_host(urlparse(url).netloc)
-    except Exception:
-        return False
-
-    # точное совпадение домена или поддомен
-    return any(host == d or host.endswith("." + d) for d in allowed)
-
-
-def check_url_with_recheck(
-    url: str,
-    timeout: int,
-    recheck_delay: int,
-    recheck_attempts: int,
-    recheck_only_domains: str,
-) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-    """
-    Многократно проверяет URL с задержкой между попытками.
-    Возвращает результат последней попытки (status_code, error_text, final_url).
-
-    Важно: использует ваш check_url(), поэтому заголовки и allow_redirects сохраняются.
-    """
-    attempts = max(1, int(recheck_attempts))
-    delay = max(0, int(recheck_delay))
-
-    # если повторы отключены или URL не попадает под доменные условия
-    if attempts == 1 or delay == 0 or not should_recheck(url, recheck_only_domains):
-        return check_url(url, timeout=timeout)
-
-    last_status: Optional[int] = None
-    last_error: Optional[str] = None
-    last_final: Optional[str] = None
-
-    for i in range(attempts):
-        status, error, final_url = check_url(url, timeout=timeout)
-        last_status, last_error, last_final = status, error, final_url
-
-        # если это последняя попытка — выходим
-        if i == attempts - 1:
-            break
-
-        # если запрос упал (status=None), всё равно можно повторить после паузы
-        time.sleep(delay)
-
-    return last_status, last_error, last_final
-
+def extract_urls_from_ad(ad: Dict) -> List[str]:
+    """Достаёт Href из разных типов объявлений (TextAd, DynamicTextAd, TextAdBuilderAd)."""
+    urls: List[str] = []
+    for key in ("TextAd", "DynamicTextAd", "TextAdBuilderAd"):
+        sub = ad.get(key)
+        if sub:
+            href = sub.get("Href")
+            if href:
+                urls.append(href)
+    return urls
 
 def load_skip_campaigns(path: Optional[str]) -> Set[int]:
     """
@@ -324,23 +322,6 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--list-campaigns",
         action="store_true",
         help="Вывести список активных кампаний (Id + Name) и завершить работу.",
-    )
-    parser.add_argument(
-        "--recheck-delay",
-        type=int,
-        default=0,
-        help="Задержка (сек) перед повторной проверкой URL. 0 — отключено.",
-    )
-    parser.add_argument(
-        "--recheck-attempts",
-        type=int,
-        default=1,
-        help="Сколько всего проверок URL выполнить (1 — как сейчас, без повторов).",
-    )
-    parser.add_argument(
-        "--recheck-only-domains",
-        default="",
-        help="Повторно проверять только эти домены (через запятую). Пусто — для всех.",
     )
     return parser.parse_args(argv)
 
@@ -500,14 +481,8 @@ def main(argv: List[str]) -> int:
             for ad in client.iter_ads(campaign_id):
                 ad_id = int(ad.get("Id"))
                 for url in extract_urls_from_ad(ad):
-                    # status, error, final_url = check_url(url, timeout=args.timeout)
-                    status, error, final_url = check_url_with_recheck(
-                        url=url,
-                        timeout=args.timeout,
-                        recheck_delay=args.recheck_delay,
-                        recheck_attempts=args.recheck_attempts,
-                        recheck_only_domains=args.recheck_only_domains,
-                    )
+                    status, error, final_url = check_url(url, timeout=args.timeout)
+
                     stub = is_stub_final_url(final_url)
 
                     if status is not None and 200 <= status < 300 and not stub:
