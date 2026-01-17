@@ -10,7 +10,6 @@ import requests
 
 API_URL_BASE = "https://api.direct.yandex.com/json/v5"
 
-
 # Описания для наиболее частых кодов ошибок
 HTTP_STATUS_DESCRIPTIONS: Dict[int, str] = {
     400: "неверный запрос",
@@ -36,12 +35,16 @@ STUB_ADMITAD_PATH_PREFIX = "/wall/offers"
 
 class YandexDirectClient:
     def __init__(self, token: str, client_login: str, language: str = "ru", api_timeout: int = 30) -> None:
+        """Сохраняет токен, логин, язык и таймаут API для дальнейших запросов.
+        """
         self.token = token
         self.client_login = client_login
         self.language = language
         self.api_timeout = api_timeout
 
     def _request(self, service: str, method: str, params: Dict) -> Dict:
+        """Делает POST-запрос к API Директа, проверяет HTTP-ошибки и ошибки API, возвращает result.
+        """
         url = f"{API_URL_BASE}/{service}"
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -67,6 +70,7 @@ class YandexDirectClient:
         return payload.get("result", {})
 
     def iter_active_campaign_ids(self) -> Iterable[Tuple[int, str]]:
+        """Запрашивает активные кампании (State=ON, Status=ACCEPTED) и отдаёт пары (campaign_id, name)."""
         params = {
             "SelectionCriteria": {"States": ["ON"], "Statuses": ["ACCEPTED"]},
             "FieldNames": ["Id", "Name", "State", "Status"],
@@ -93,7 +97,6 @@ class YandexDirectClient:
             result = self._request("ads", "get", params)
             for ad in result.get("Ads", []):
                 state = ad.get("State")
-                # Только реально крутящиеся объявления
                 if state != "ON":
                     continue
                 yield ad
@@ -105,6 +108,7 @@ class YandexDirectClient:
 
 
 def extract_urls_from_ad(ad: Dict) -> List[str]:
+    """Достаёт Href из разных типов объявлений (TextAd, DynamicTextAd, TextAdBuilderAd)."""
     urls: List[str] = []
     for key in ("TextAd", "DynamicTextAd", "TextAdBuilderAd"):
         sub = ad.get(key)
@@ -115,11 +119,11 @@ def extract_urls_from_ad(ad: Dict) -> List[str]:
     return urls
 
 
-def check_url(url: str, timeout: int = 10) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """
-    Возвращает (status_code, error_text, final_url).
-
-    final_url — итоговый URL после всех редиректов (нужен для проверки заглушек).
+    Делает GET по ссылке с редиректами, возвращает (status_code, error_text, final_url),
+    final_url — итоговый URL после всех редиректов (нужен для проверки заглушек);
+    при ошибке — status_code=None.
     """
     headers = {
         "User-Agent": (
@@ -135,6 +139,69 @@ def check_url(url: str, timeout: int = 10) -> Tuple[Optional[int], Optional[str]
         return response.status_code, None, response.url
     except requests.RequestException as exc:
         return None, str(exc), None
+
+
+def _normalize_host(host: str) -> str:
+    host = (host or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def should_recheck(url: str, domains_csv: str) -> bool:
+    """
+    Если domains_csv пуст — повторяем для всех URL.
+    Если задан — повторяем только для доменов из списка.
+    """
+    if not domains_csv.strip():
+        return True
+
+    allowed = {_normalize_host(x) for x in domains_csv.split(",") if x.strip()}
+    try:
+        host = _normalize_host(urlparse(url).netloc)
+    except Exception:
+        return False
+
+    # точное совпадение домена или поддомен
+    return any(host == d or host.endswith("." + d) for d in allowed)
+
+
+def check_url_with_recheck(
+    url: str,
+    timeout: int,
+    recheck_delay: int,
+    recheck_attempts: int,
+    recheck_only_domains: str,
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Многократно проверяет URL с задержкой между попытками.
+    Возвращает результат последней попытки (status_code, error_text, final_url).
+
+    Важно: использует ваш check_url(), поэтому заголовки и allow_redirects сохраняются.
+    """
+    attempts = max(1, int(recheck_attempts))
+    delay = max(0, int(recheck_delay))
+
+    # если повторы отключены или URL не попадает под доменные условия
+    if attempts == 1 or delay == 0 or not should_recheck(url, recheck_only_domains):
+        return check_url(url, timeout=timeout)
+
+    last_status: Optional[int] = None
+    last_error: Optional[str] = None
+    last_final: Optional[str] = None
+
+    for i in range(attempts):
+        status, error, final_url = check_url(url, timeout=timeout)
+        last_status, last_error, last_final = status, error, final_url
+
+        # если это последняя попытка — выходим
+        if i == attempts - 1:
+            break
+
+        # если запрос упал (status=None), всё равно можно повторить после паузы
+        time.sleep(delay)
+
+    return last_status, last_error, last_final
 
 
 def load_skip_campaigns(path: Optional[str]) -> Set[int]:
@@ -158,7 +225,6 @@ def load_skip_campaigns(path: Optional[str]) -> Set[int]:
                     cid = int(raw)
                     skip_ids.add(cid)
                 except ValueError:
-                    # Игнорируем мусорные строки
                     continue
     except Exception as e:
         print(f"Не удалось прочитать файл списка кампаний для пропуска '{path}': {e}", file=sys.stderr)
@@ -166,7 +232,34 @@ def load_skip_campaigns(path: Optional[str]) -> Set[int]:
     return skip_ids
 
 
+def parse_target_campaign_ids(args: argparse.Namespace) -> Optional[Set[int]]:
+    """
+    Возвращает множество целевых ID кампаний, если фильтр задан, иначе None.
+    Поддерживает:
+      --campaign-id (можно многократно)
+      --campaign-ids "1,2,3"
+    """
+    ids: Set[int] = set()
+
+    if args.campaign_id:
+        ids.update(int(x) for x in args.campaign_id if x is not None)
+
+    if args.campaign_ids:
+        for part in str(args.campaign_ids).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ids.add(int(part))
+            except ValueError:
+                continue
+
+    return ids if ids else None
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
+    """"Описывает и парсит аргументы командной строки (токен/логин/таймауты/пути/Telegram)
+    """
     parser = argparse.ArgumentParser(description="Проверка ссылок в активных кампаниях Яндекс.Директа.")
     parser.add_argument(
         "--token",
@@ -197,7 +290,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--telegram-chat-id",
         default=os.getenv("TELEGRAM_CHAT_ID"),
-        help="ID чата/юзера для отправки отчёта (по умолчанию TELEGRAM_CHAT_ID).",
+        help="ID чата для детального отчёта и логов (по умолчанию TELEGRAM_CHAT_ID).",
+    )
+    parser.add_argument(
+        "--telegram-main-chat-id",
+        default=os.getenv("TELEGRAM_MAIN_CHAT_ID"),
+        help="ID чата для основного отчёта (для Лемуры). Если не задан, используется telegram-chat-id.",
     )
     parser.add_argument(
         "--api-timeout",
@@ -210,15 +308,50 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default="skip_campaigns.txt",
         help="Путь к файлу со списком ID кампаний, которые нужно пропускать (по умолчанию skip_campaigns.txt).",
     )
+    parser.add_argument(
+        "--campaign-id",
+        action="append",
+        type=int,
+        default=None,
+        help="Проверять только кампанию с указанным ID. Можно указать несколько раз: --campaign-id 1 --campaign-id 2",
+    )
+    parser.add_argument(
+        "--campaign-ids",
+        default=None,
+        help="Проверять только кампании из списка (через запятую), например: --campaign-ids 123,456",
+    )
+    parser.add_argument(
+        "--list-campaigns",
+        action="store_true",
+        help="Вывести список активных кампаний (Id + Name) и завершить работу.",
+    )
+    parser.add_argument(
+        "--recheck-delay",
+        type=int,
+        default=0,
+        help="Задержка (сек) перед повторной проверкой URL. 0 — отключено.",
+    )
+    parser.add_argument(
+        "--recheck-attempts",
+        type=int,
+        default=1,
+        help="Сколько всего проверок URL выполнить (1 — как сейчас, без повторов).",
+    )
+    parser.add_argument(
+        "--recheck-only-domains",
+        default="",
+        help="Повторно проверять только эти домены (через запятую). Пусто — для всех.",
+    )
     return parser.parse_args(argv)
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
+    """Отправляет текстовое сообщение в Telegram через sendMessage, возвращает успех/ошибку.
+    """
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
-        # parse_mode специально НЕ включаем, чтобы не ловить ошибки парсинга
     }
     try:
         r = requests.post(url, json=payload, timeout=10)
@@ -234,6 +367,9 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
 
 
 def send_telegram_document(token: str, chat_id: str, file_path: str, caption: Optional[str] = None) -> bool:
+    """
+    Отправляет файл в Telegram через sendDocument (лог), возвращает успех/ошибку.
+    """
     url = f"https://api.telegram.org/bot{token}/sendDocument"
     data = {"chat_id": chat_id}
     if caption:
@@ -256,7 +392,7 @@ def send_telegram_document(token: str, chat_id: str, file_path: str, caption: Op
 
 def is_stub_final_url(final_url: Optional[str]) -> bool:
     """
-    Возвращает True, если итоговый URL ведёт на заглушку партнёрской сети.
+    Проверяет, ведёт ли final_url на домены/пути «заглушек» партнёрских сетей.
     """
     if not final_url:
         return False
@@ -276,7 +412,7 @@ def is_stub_final_url(final_url: Optional[str]) -> bool:
 
 def format_campaign_with_name(camp_id: int, names: Dict[int, str]) -> str:
     """
-    Строка вида: 'Кампания 123456 (My Campaign Name)' или без имени, если его нет.
+    Формирует строку вида Кампания ID (Name) если имя известно, иначе Кампания ID.
     """
     name = names.get(camp_id)
     if name:
@@ -285,31 +421,33 @@ def format_campaign_with_name(camp_id: int, names: Dict[int, str]) -> str:
 
 
 def main(argv: List[str]) -> int:
+    """
+    Основной сценарий:
+    собирает кампании, проверяет ссылки объявлений, группирует проблемы, пишет лог,
+    отправляет отчёты в Telegram, печатает длительность.
+    """
     args = parse_args(argv)
+    target_campaign_ids = parse_target_campaign_ids(args)
     start_time = time.time()
 
-    # --- Готовим путь к файлу логов в папке _logs рядом со скриптом ---
+    # --- Логи в _logs рядом со скриптом ---
     now_str_file = time.strftime("%Y-%m-%d_%H-%M-%S")
-
-    # Директория скрипта
     script_dir = os.path.dirname(os.path.abspath(__file__))
     log_dir = os.path.join(script_dir, "_logs")
     os.makedirs(log_dir, exist_ok=True)
 
-    # Берём только имя файла из аргумента (например, "results.txt")
     orig_name = os.path.basename(args.output_file)
     base_name, ext = os.path.splitext(orig_name)
     if not ext:
         ext = ".txt"
 
-    # Собираем полный путь: /scripts/check_campaign/_logs/results_YYYY-MM-DD_HH-MM-SS.txt
     args.output_file = os.path.join(log_dir, f"{base_name}_{now_str_file}{ext}")
 
     if not args.token or not args.client_login:
         print("Необходимо передать токен и Client-Login через параметры или переменные окружения.", file=sys.stderr)
         return 1
 
-    # Загружаем кампании, которые нужно пропускать
+    # Кампании для пропуска
     skip_campaigns: Set[int] = load_skip_campaigns(args.skip_campaigns_file)
     if skip_campaigns:
         print(f"Кампаний для пропуска: {len(skip_campaigns)} (из файла {args.skip_campaigns_file})")
@@ -321,21 +459,32 @@ def main(argv: List[str]) -> int:
         client_login=args.client_login,
         api_timeout=args.api_timeout,
     )
+    if args.list_campaigns:
+        print("Активные кампании (ON + ACCEPTED):")
+        for campaign_id, name in client.iter_active_campaign_ids():
+            print(f"{campaign_id}\t{name}")
+        return 0
 
     any_issue = False
-    lines: List[str] = []  # полный лог для файла
+    lines: List[str] = []
 
     # HTTP-ошибки по ссылкам:
-    # кампания_id -> список проблем:
-    # (ad_id, url, status_code_or_None, description_or_error_text, is_stub)
+    # кампания_id -> список: (ad_id, url, status_code_or_None, description_or_error_text, is_stub)
     issues_http: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
     # Ошибки API по кампаниям
     issues_api: Dict[int, str] = {}
-    # Сопоставление ID кампании с её названием
+    # ID кампании -> имя
     campaign_names: Dict[int, str] = {}
+
+    seen_campaign_ids: Set[int] = set()
 
     for campaign_id, name in client.iter_active_campaign_ids():
         campaign_names[campaign_id] = name
+        seen_campaign_ids.add(campaign_id)
+
+        # Если задан фильтр по кампаниям — берём только их
+        if target_campaign_ids is not None and campaign_id not in target_campaign_ids:
+            continue
 
         if campaign_id in skip_campaigns:
             skip_msg = f"Пропускаем кампанию: {name} (ID {campaign_id}) — есть в списке исключений."
@@ -351,25 +500,27 @@ def main(argv: List[str]) -> int:
             for ad in client.iter_ads(campaign_id):
                 ad_id = int(ad.get("Id"))
                 for url in extract_urls_from_ad(ad):
-                    status, error, final_url = check_url(url, timeout=args.timeout)
+                    # status, error, final_url = check_url(url, timeout=args.timeout)
+                    status, error, final_url = check_url_with_recheck(
+                        url=url,
+                        timeout=args.timeout,
+                        recheck_delay=args.recheck_delay,
+                        recheck_attempts=args.recheck_attempts,
+                        recheck_only_domains=args.recheck_only_domains,
+                    )
                     stub = is_stub_final_url(final_url)
 
                     if status is not None and 200 <= status < 300 and not stub:
-                        # Любой 2xx считаем ОК, если это не заглушка партнёрской сети.
                         msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} (OK)"
                         print(msg)
                         lines.append(msg)
                         continue
 
-                    # Всё остальное — ошибка
                     any_issue = True
 
                     if stub:
                         desc = "переход на заглушку партнёрской сети"
-                        msg = (
-                            f"  Объявление {ad_id}: ссылка {url} ведёт на {final_url} "
-                            f"({desc})"
-                        )
+                        msg = f"  Объявление {ad_id}: ссылка {url} ведёт на {final_url} ({desc})"
                         issues_http[campaign_id].append((ad_id, url, status, desc, True))
                     elif status is None:
                         desc = error or "ошибка запроса, подробности отсутствуют"
@@ -396,6 +547,16 @@ def main(argv: List[str]) -> int:
             lines.append(msg)
             issues_api[campaign_id] = err_text
 
+    if target_campaign_ids is not None:
+        missing = sorted(target_campaign_ids - seen_campaign_ids)
+        if missing:
+            msg = (
+                "Внимание: указанные кампании не найдены среди активных (ON + ACCEPTED): "
+                + ", ".join(map(str, missing))
+            )
+            print(msg)
+            lines.append(msg)
+
     summary_line = (
         "Найдены ссылки с отличным от 2xx ответом или ведущие на заглушку."
         if any_issue
@@ -412,7 +573,8 @@ def main(argv: List[str]) -> int:
     log_content.append(f"Дата и время запуска: {now_str}")
     if skip_campaigns:
         log_content.append(
-            f"Кампании, пропущенные по списку ({args.skip_campaigns_file}): {', '.join(map(str, sorted(skip_campaigns)))}"
+            f"Кампании, пропущенные по списку ({args.skip_campaigns_file}): "
+            f"{', '.join(map(str, sorted(skip_campaigns)))}"
         )
     log_content.append("")
     log_content.extend(lines)
@@ -425,12 +587,12 @@ def main(argv: List[str]) -> int:
         print(f"Ошибка записи файла: {e}", file=sys.stderr)
 
     # --- подготовка и отправка отчёта в Telegram ---
-    if args.telegram_token and args.telegram_chat_id:
+    main_chat_id = args.telegram_main_chat_id or args.telegram_chat_id
+    detail_chat_id = args.telegram_chat_id  # сюда доп. коды и лог
+
+    if args.telegram_token and (main_chat_id or detail_chat_id):
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
         if issues_http or issues_api:
-            total_campaigns_http = len(issues_http)
-            total_ads_http = sum(len(ads) for ads in issues_http.values())
-
             # Разбиваем проблемы на группы:
             group_stub: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
             group_404: Dict[int, List[Tuple[int, str, Optional[int], Optional[str], bool]]] = defaultdict(list)
@@ -448,79 +610,96 @@ def main(argv: List[str]) -> int:
                     else:
                         group_other[camp_id].append((ad_id, url, status_code, desc, stub))
 
-            # --- 1. Основное сообщение (для Lemur) ---
-            main_lines: List[str] = []
-            main_lines.append(f"✨ Отчёт проверки ссылок — {now_str}")
-            main_lines.append("")
-            main_lines.append("❌ Ошибки найдены")
-            main_lines.append(f"📂 Кампаний с ошибками: {total_campaigns_http}")
-            main_lines.append(f"📣 Объявлений с ошибками: {total_ads_http}")
-            main_lines.append("")
+            # Критические: заглушки + 404 + "код не получен"
+            critical_campaign_ids: Set[int] = (
+                set(group_stub.keys()) | set(group_404.keys()) | set(group_no_code.keys())
+            )
+            total_critical_campaigns = len(critical_campaign_ids)
+            total_critical_ads = (
+                sum(len(v) for v in group_stub.values())
+                + sum(len(v) for v in group_404.values())
+                + sum(len(v) for v in group_no_code.values())
+            )
 
-            if group_stub:
-                main_lines.append("🟣 Переход на заглушку партнёрской сети:")
-                for camp_id, problems in sorted(group_stub.items()):
-                    camp_title = format_campaign_with_name(camp_id, campaign_names)
-                    main_lines.append(f"- {camp_title}:")
-                    for ad_id, url, status_code, desc, _stub in problems:
-                        main_lines.append(
-                            f"  • Объявление {ad_id}: ссылка {url} — {desc}."
-                        )
-                    main_lines.append("")
+            # Прочие коды HTTP
+            other_campaign_ids: Set[int] = set(group_other.keys())
+            total_other_campaigns = len(other_campaign_ids)
+            total_other_ads = sum(len(v) for v in group_other.values())
 
-            if group_404:
-                main_lines.append("🔴 Ответ 404 (страница не найдена):")
-                for camp_id, problems in sorted(group_404.items()):
-                    camp_title = format_campaign_with_name(camp_id, campaign_names)
-                    main_lines.append(f"- {camp_title}:")
-                    for ad_id, url, status_code, desc, _stub in problems:
-                        main_lines.append(
-                            f"  • Объявление {ad_id}: ссылка {url} отвечает 404 (страница не найдена)."
-                        )
-                    main_lines.append("")
-
-            if group_no_code:
-                main_lines.append("⚪ Код не получен (проверьте вручную):")
-                for camp_id, problems in sorted(group_no_code.items()):
-                    camp_title = format_campaign_with_name(camp_id, campaign_names)
-                    main_lines.append(f"- {camp_title}:")
-                    for ad_id, url, status_code, desc, _stub in problems:
-                        text_err = desc or "код не получен, проверьте вручную"
-                        main_lines.append(
-                            f"  • Объявление {ad_id}: ссылка {url} — {text_err}."
-                        )
-                    main_lines.append("")
-
-            if issues_api:
-                main_lines.append("⚠ Ошибки API Яндекс.Директа:")
-                for camp_id, err in sorted(issues_api.items()):
-                    camp_title = format_campaign_with_name(camp_id, campaign_names)
-                    main_lines.append(f"- {camp_title}: {err}")
+            # --- 1. Основное сообщение (главный чат: только критика) ---
+            if main_chat_id:
+                main_lines: List[str] = []
+                main_lines.append(f"✨ Отчёт проверки ссылок — {now_str}")
+                main_lines.append("")
+                if total_critical_ads > 0 or issues_api:
+                    main_lines.append("❌ Критические ошибки найдены")
+                else:
+                    main_lines.append("🟢 Критических ошибок не найдено")
+                main_lines.append(f"📂 Кампаний с критическими ошибками: {total_critical_campaigns}")
+                main_lines.append(f"📣 Объявлений с критическими ошибками: {total_critical_ads}")
                 main_lines.append("")
 
-            main_lines.append(f"📄 Полный лог: {args.output_file}")
+                if group_stub:
+                    main_lines.append("🟣 Переход на заглушку партнёрской сети:")
+                    for camp_id, problems in sorted(group_stub.items()):
+                        camp_title = format_campaign_with_name(camp_id, campaign_names)
+                        main_lines.append(f"- {camp_title}:")
+                        for ad_id, url, status_code, desc, _stub in problems:
+                            main_lines.append(f"  • Объявление {ad_id}: ссылка {url} — {desc}.")
+                        main_lines.append("")
 
-            main_text = "\n".join(main_lines)
-            if len(main_text) > 4000:
-                main_text = main_text[:3990] + "\n…обрезано, см. полный лог в файле."
+                if group_404:
+                    main_lines.append("🔴 Ответ 404 (страница не найдена):")
+                    for camp_id, problems in sorted(group_404.items()):
+                        camp_title = format_campaign_with_name(camp_id, campaign_names)
+                        main_lines.append(f"- {camp_title}:")
+                        for ad_id, url, status_code, desc, _stub in problems:
+                            main_lines.append(
+                                f"  • Объявление {ad_id}: ссылка {url} отвечает 404 (страница не найдена)."
+                            )
+                        main_lines.append("")
 
-            sent_main = send_telegram_message(args.telegram_token, args.telegram_chat_id, main_text)
-            print("\nОсновной отчёт:")
-            print(main_text)
-            if sent_main:
-                print("Основной отчёт отправлен в Telegram.")
-            else:
-                print("Не удалось отправить основной отчёт в Telegram, см. сообщение об ошибке выше.")
+                if group_no_code:
+                    main_lines.append("⚪ Код не получен (проверьте вручную):")
+                    for camp_id, problems in sorted(group_no_code.items()):
+                        camp_title = format_campaign_with_name(camp_id, campaign_names)
+                        main_lines.append(f"- {camp_title}:")
+                        for ad_id, url, status_code, desc, _stub in problems:
+                            text_err = desc or "код не получен, проверьте вручную"
+                            main_lines.append(f"  • Объявление {ad_id}: ссылка {url} — {text_err}.")
+                        main_lines.append("")
 
-            # --- 2. Доп. сообщение с «другими кодами» (для тебя) ---
-            if group_other:
+                if issues_api:
+                    main_lines.append("⚠ Ошибки API Яндекс.Директа:")
+                    for camp_id, err in sorted(issues_api.items()):
+                        camp_title = format_campaign_with_name(camp_id, campaign_names)
+                        main_lines.append(f"- {camp_title}: {err}")
+                    main_lines.append("")
+
+                main_lines.append(f"📄 Полный лог: {os.path.basename(args.output_file)}")
+
+                main_text = "\n".join(main_lines)
+                if len(main_text) > 4000:
+                    main_text = main_text[:3990] + "\n…обрезано, см. полный лог в файле."
+
+                sent_main = send_telegram_message(args.telegram_token, main_chat_id, main_text)
+                print("\nОсновной отчёт:")
+                print(main_text)
+                if sent_main:
+                    print("Основной отчёт отправлен в Telegram.")
+                else:
+                    print("Не удалось отправить основной отчёт в Telegram, см. сообщение об ошибке выше.")
+
+            # --- 2. Доп. сообщение с «другими кодами» (только в твой чат) ---
+            if group_other and detail_chat_id:
                 extra_lines: List[str] = []
                 extra_lines.append(
-                    "Сообщение для Lemurы: тебе достаточно предыдущего сообщения, это доп. детали по другим кодам."
+                    "Сообщение для Лемуры: тебе достаточно основного отчёта, это доп. детали по другим кодам."
                 )
                 extra_lines.append("")
                 extra_lines.append("🟠 Дополнительные ошибки (другие коды HTTP):")
-                extra_lines.append(f"📂 Кампаний с такими ошибками: {len(group_other)}")
+                extra_lines.append(f"📂 Кампаний с такими ошибками: {total_other_campaigns}")
+                extra_lines.append(f"📣 Объявлений с такими ошибками: {total_other_ads}")
                 extra_lines.append("")
 
                 for camp_id, problems in sorted(group_other.items()):
@@ -542,7 +721,7 @@ def main(argv: List[str]) -> int:
                 if len(extra_text) > 4000:
                     extra_text = extra_text[:3990] + "\n…обрезано, см. полный лог в файле."
 
-                sent_extra = send_telegram_message(args.telegram_token, args.telegram_chat_id, extra_text)
+                sent_extra = send_telegram_message(args.telegram_token, detail_chat_id, extra_text)
                 print("\nДополнительный отчёт (другие коды):")
                 print(extra_text)
                 if sent_extra:
@@ -550,34 +729,40 @@ def main(argv: List[str]) -> int:
                 else:
                     print("Не удалось отправить дополнительный отчёт в Telegram, см. сообщение об ошибке выше.")
 
-            # --- 3. Лог файлом ---
-            caption = "Полный лог проверки ссылок во вложении."
-            sent_doc = send_telegram_document(args.telegram_token, args.telegram_chat_id, args.output_file, caption)
-            if sent_doc:
-                print("Файл лога отправлен в Telegram.")
-            else:
-                print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
+            # --- 3. Лог файлом (только в твой чат) ---
+            if detail_chat_id:
+                caption = "Полный лог проверки ссылок во вложении."
+                sent_doc = send_telegram_document(args.telegram_token, detail_chat_id, args.output_file, caption)
+                if sent_doc:
+                    print("Файл лога отправлен в Telegram.")
+                else:
+                    print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
+
         else:
+            # Ошибок нет
             ok_text = (
                 f"✨ Отчёт проверки ссылок — {now_str}\n\n"
                 f"🟢 Ошибок не найдено. Все проверенные ссылки отвечают 2xx и не ведут на заглушки."
             )
-            sent_msg = send_telegram_message(args.telegram_token, args.telegram_chat_id, ok_text)
-            print("\nСообщение для Telegram:")
-            print(ok_text)
-            if sent_msg:
-                print("Сообщение об отсутствии ошибок отправлено в Telegram.")
-            else:
-                print("Не удалось отправить сообщение в Telegram, см. сообщение об ошибке выше.")
+            if main_chat_id:
+                sent_msg = send_telegram_message(args.telegram_token, main_chat_id, ok_text)
+                print("\nСообщение для Telegram:")
+                print(ok_text)
+                if sent_msg:
+                    print("Сообщение об отсутствии ошибок отправлено в Telegram.")
+                else:
+                    print("Не удалось отправить сообщение в Telegram, см. сообщение об ошибке выше.")
 
-            caption = "Полный лог проверки ссылок (ошибок не найдено)."
-            sent_doc = send_telegram_document(args.telegram_token, args.telegram_chat_id, args.output_file, caption)
-            if sent_doc:
-                print("Файл лога отправлен в Telegram.")
-            else:
-                print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
+            # Лог при отсутствии ошибок — только в твой чат (если есть)
+            if detail_chat_id:
+                caption = "Полный лог проверки ссылок (ошибок не найдено)."
+                sent_doc = send_telegram_document(args.telegram_token, detail_chat_id, args.output_file, caption)
+                if sent_doc:
+                    print("Файл лога отправлен в Telegram.")
+                else:
+                    print("Не удалось отправить файл лога в Telegram, см. сообщение об ошибке выше.")
     else:
-        print("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы, отчёт в Telegram не отправлен.")
+        print("TELEGRAM_BOT_TOKEN не задан или не задан ни один чат, отчёт в Telegram не отправлен.")
 
     duration = time.time() - start_time
     minutes = int(duration // 60)
@@ -601,3 +786,133 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
+
+"""
+===============================================================================
+СПРАВОЧНИК ЗАПУСКА check_links.py
+===============================================================================
+
+Обязательные параметры:
+  --token            OAuth-токен Яндекс.Директа
+  --client-login     Логин рекламного кабинета (без @yandex.ru)
+
+------------------------------------------------------------------------------
+1. БАЗОВЫЕ РЕЖИМЫ
+------------------------------------------------------------------------------
+
+1.1. Проверка всех активных кампаний (ON + ACCEPTED), без Telegram
+python3 check_links.py \
+  --token "..." \
+  --client-login "..."
+
+1.2. Проверка всех активных кампаний + Telegram-отчёты
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --telegram-token "..." \
+  --telegram-chat-id "..." \
+  --telegram-main-chat-id "..."
+
+1.3. Только вывести список активных кампаний и выйти
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --list-campaigns
+
+------------------------------------------------------------------------------
+2. ТЕСТИРОВАНИЕ ОТДЕЛЬНЫХ КАМПАНИЙ
+------------------------------------------------------------------------------
+
+2.1. Проверка одной конкретной кампании
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --campaign-id 704059435
+
+2.2. Проверка нескольких кампаний (через несколько флагов)
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --campaign-id 704059435 \
+  --campaign-id 704059999
+
+2.3. Проверка нескольких кампаний (через список)
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --campaign-ids 704059435,704059999
+
+------------------------------------------------------------------------------
+3. ПРОВЕРКА С ПОВТОРНОЙ ПРОВЕРКОЙ (ANTI-JS / TIMER REDIRECTS)
+------------------------------------------------------------------------------
+
+3.1. Повторная проверка ВСЕХ ссылок:
+     2 попытки, между ними 7 секунд
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --recheck-delay 7 \
+  --recheck-attempts 2
+
+3.2. Повторная проверка только для партнёрских доменов
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --recheck-delay 7 \
+  --recheck-attempts 2 \
+  --recheck-only-domains "ad.admitad.com,offerwall.admitad.com,tb.gdeslon.ru,bankpro.su"
+
+3.3. Тест одной кампании + повторная проверка партнёрских ссылок
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --campaign-id 704059435 \
+  --recheck-delay 7 \
+  --recheck-attempts 2 \
+  --recheck-only-domains "ad.admitad.com"
+
+------------------------------------------------------------------------------
+4. РЕЖИМЫ БЕЗ TELEGRAM (ЛОКАЛЬНЫЕ ПРОГОНЫ)
+------------------------------------------------------------------------------
+
+4.1. Telegram отключён автоматически, если не передавать параметры
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --campaign-id 704059435
+
+4.2. Явное отключение Telegram (если добавлен флаг --no-telegram)
+python3 check_links.py \
+  --token "..." \
+  --client-login "..." \
+  --campaign-id 704059435 \
+  --no-telegram
+
+------------------------------------------------------------------------------
+5. ВСПОМОГАТЕЛЬНЫЕ ПАРАМЕТРЫ
+------------------------------------------------------------------------------
+
+--timeout N
+  Таймаут HTTP-запроса к URL (по умолчанию 10 сек)
+
+--api-timeout N
+  Таймаут запросов к API Яндекс.Директа (по умолчанию 30 сек)
+
+--skip-campaigns-file path
+  Файл со списком ID кампаний, которые нужно пропускать
+
+--output-file name.txt
+  Базовое имя файла отчёта (реальный файл создаётся в папке _logs)
+
+------------------------------------------------------------------------------
+ПРИМЕЧАНИЯ
+------------------------------------------------------------------------------
+• Повторная проверка полезна для ссылок с JS / countdown редиректами.
+• Финальный результат берётся по ПОСЛЕДНЕЙ попытке проверки.
+• Если кампания указана, но не активна (не ON + ACCEPTED) —
+  будет выведено предупреждение.
+• Логи всегда сохраняются локально, даже если Telegram отключён.
+
+===============================================================================
+"""
