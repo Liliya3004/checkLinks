@@ -29,6 +29,7 @@ HTTP_STATUS_DESCRIPTIONS: Dict[int, str] = {
 STUB_DOMAINS = {
     "bankpro.su",
     "tb.gdeslon.ru",
+    "go.checkscan.ru",
 }
 
 STUB_ADMITAD_HOST = "offerwall.admitad.com"
@@ -44,6 +45,22 @@ CLIENT_REDIRECT_PATTERNS = [
     # location.replace("...")
     re.compile(r'location\.replace\(\s*["\']([^"\']+)["\']\s*\)', re.I),
 ]
+
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")
+def get_telegram_proxies() -> Optional[dict]:
+    """
+    Возвращает proxies для requests только для Telegram.
+    Формат TELEGRAM_PROXY:
+      http://login:password@host:port
+      socks5h://login:password@host:port
+    """
+    if not TELEGRAM_PROXY:
+        return None
+
+    return {
+        "http": TELEGRAM_PROXY,
+        "https": TELEGRAM_PROXY,
+    }
 
 
 class YandexDirectClient:
@@ -136,27 +153,6 @@ def extract_client_redirect_url(html: str, base_url: str) -> Optional[str]:
     return None
 
 
-# def check_url_verbose(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
-#     """
-#     Возвращает (status_code, error_text, final_url, html_text).
-#     html_text будет только для HTML-ответов, иначе None.
-#     """
-#     headers = {
-#         "User-Agent": (
-#             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-#             "AppleWebKit/537.36 (KHTML, like Gecko) "
-#             "Chrome/124.0.0.0 Safari/537.36"
-#         ),
-#         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-#         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-#     }
-#     try:
-#         r = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
-#         content_type = (r.headers.get("Content-Type") or "").lower()
-#         html = r.text if "text/html" in content_type else None
-#         return r.status_code, None, r.url, html
-#     except requests.RequestException as exc:
-#         return None, str(exc), None, None
 def check_url_verbose(
     url: str,
     timeout: int = 120,
@@ -231,26 +227,7 @@ def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str
             return status, error, client_target
 
     return status, error, final_url
-# def check_url(url: str, timeout: int = 120) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-#     """
-#     Делает GET по ссылке с редиректами, возвращает (status_code, error_text, final_url),
-#     final_url — итоговый URL после всех редиректов (нужен для проверки заглушек);
-#     при ошибке — status_code=None.
-#     """
-#     headers = {
-#         "User-Agent": (
-#             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-#             "AppleWebKit/537.36 (KHTML, like Gecko) "
-#             "Chrome/124.0.0.0 Safari/537.36"
-#         ),
-#         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-#         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-#     }
-#     try:
-#         response = requests.get(url, headers=headers, allow_redirects=True, timeout=timeout)
-#         return response.status_code, None, response.url
-#     except requests.RequestException as exc:
-#         return None, str(exc), None
+
 
 def extract_urls_from_ad(ad: Dict) -> List[str]:
     """Достаёт Href из разных типов объявлений (TextAd, DynamicTextAd, TextAdBuilderAd)."""
@@ -262,6 +239,7 @@ def extract_urls_from_ad(ad: Dict) -> List[str]:
             if href:
                 urls.append(href)
     return urls
+
 
 def load_skip_campaigns(path: Optional[str]) -> Set[int]:
     """
@@ -410,15 +388,21 @@ def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
-    """Отправляет текстовое сообщение в Telegram через sendMessage, возвращает успех/ошибку.
-    """
+    """Отправляет текстовое сообщение в Telegram через sendMessage, возвращает успех/ошибку."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
     }
+    proxies = get_telegram_proxies()
+
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(
+            url,
+            json=payload,
+            timeout=10,
+            proxies=proxies,
+        )
         r.raise_for_status()
         data = r.json()
         if not data.get("ok"):
@@ -439,16 +423,27 @@ def send_telegram_document(token: str, chat_id: str, file_path: str, caption: Op
     if caption:
         data["caption"] = caption
 
+    proxies = get_telegram_proxies()
+
     try:
         with open(file_path, "rb") as f:
             files = {"document": (os.path.basename(file_path), f)}
-            r = requests.post(url, data=data, files=files, timeout=30)
+            r = requests.post(
+                url,
+                data=data,
+                files=files,
+                timeout=30,
+                proxies=proxies,
+            )
         r.raise_for_status()
         payload = r.json()
         if not payload.get("ok"):
             print(f"Telegram Document API error: {payload}", file=sys.stderr)
             return False
         return True
+    except requests.RequestException as exc:
+        print(f"Ошибка отправки документа в Telegram: {exc}", file=sys.stderr)
+        return False
     except Exception as exc:
         print(f"Ошибка отправки документа в Telegram: {exc}", file=sys.stderr)
         return False
@@ -569,7 +564,10 @@ def main(argv: List[str]) -> int:
                     stub = is_stub_final_url(final_url)
 
                     if status is not None and 200 <= status < 300 and not stub:
-                        msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} (OK)"
+                        if final_url and final_url != url:
+                            msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} (OK), final_url={final_url}"
+                        else:
+                            msg = f"  Объявление {ad_id}: ссылка {url} отвечает {status} (OK)"
                         print(msg)
                         lines.append(msg)
                         continue
@@ -752,7 +750,7 @@ def main(argv: List[str]) -> int:
             if group_other and detail_chat_id:
                 extra_lines: List[str] = []
                 extra_lines.append(
-                    "Сообщение для Лемуры: тебе достаточно основного отчёта, это доп. детали по другим кодам."
+                    "Доп. детали по другим кодам."
                 )
                 extra_lines.append("")
                 extra_lines.append("🟠 Дополнительные ошибки (другие коды HTTP):")
@@ -900,7 +898,8 @@ python3 check_links.py \
 python3 check_links.py \
   --token "..." \
   --client-login "..." \
-  --campaign-id 704059435
+  --campaign-id 88869006
+
 
 2.2. Проверка нескольких кампаний (через несколько флагов)
 python3 check_links.py \
