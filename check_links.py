@@ -3,7 +3,7 @@ import os
 import sys
 from typing import Dict, Iterable, List, Optional, Tuple, Set
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from urllib.parse import urlparse
 
 import requests
@@ -108,6 +108,58 @@ class YandexDirectClient:
         result = self._request("campaigns", "get", params)
         for campaign in result.get("Campaigns", []):
             yield int(campaign["Id"]), campaign.get("Name", "")
+
+
+    def get_campaign_stats(self) -> Dict[str, int]:
+        """
+        Возвращает статистику по кампаниям:
+        State — текущее состояние показов.
+        Status — результат модерации.
+        """
+        params = {
+            "SelectionCriteria": {},
+            "FieldNames": ["Id", "Name", "State", "Status"],
+            "Page": {"Limit": 10000, "Offset": 0},
+        }
+
+        states = Counter()
+        statuses = Counter()
+        total = 0
+
+        while True:
+            result = self._request("campaigns", "get", params)
+
+            for campaign in result.get("Campaigns", []):
+                total += 1
+                states[campaign.get("State", "UNKNOWN")] += 1
+                statuses[campaign.get("Status", "UNKNOWN")] += 1
+
+            limited_by = result.get("LimitedBy")
+            if limited_by is None:
+                break
+
+            params["Page"]["Offset"] = limited_by
+
+        return {
+            "total": total,
+
+            # State
+            "state_on": states["ON"],
+            "state_off": states["OFF"],
+            "state_suspended": states["SUSPENDED"],
+            "state_archived": states["ARCHIVED"],
+            "state_ended": states["ENDED"],
+            "state_converted": states["CONVERTED"],
+            "state_unknown": states["UNKNOWN"],
+
+            # Status
+            "status_draft": statuses["DRAFT"],
+            "status_moderation": statuses["MODERATION"],
+            "status_accepted": statuses["ACCEPTED"],
+            "status_rejected": statuses["REJECTED"],
+            "status_unknown": statuses["UNKNOWN"],
+        }
+
 
     def iter_ads(self, campaign_id: int) -> Iterable[Dict]:
         """
@@ -535,6 +587,7 @@ def main(argv: List[str]) -> int:
     # ID кампании -> имя
     campaign_names: Dict[int, str] = {}
 
+    campaign_stats = client.get_campaign_stats()
     seen_campaign_ids: Set[int] = set()
 
     for campaign_id, name in client.iter_active_campaign_ids():
@@ -685,6 +738,23 @@ def main(argv: List[str]) -> int:
             if main_chat_id:
                 main_lines: List[str] = []
                 main_lines.append(f"✨ Отчёт проверки ссылок — {now_str}")
+                main_lines.append("")
+
+                main_lines.append("📊 Статистика кампаний в Яндекс.Директе:")
+                main_lines.append(f"Всего кампаний: {campaign_stats['total']}")
+                # main_lines.append("")
+                # main_lines.append("По состоянию показов:")
+                main_lines.append(f"Активны / показы могут идти: {campaign_stats['state_on']}")
+                # main_lines.append(f"Остановлены владельцем: {campaign_stats['state_suspended']}")
+                # main_lines.append(f"Неактивны: {campaign_stats['state_off']}")
+                # main_lines.append(f"В архиве: {campaign_stats['state_archived']}")
+                # main_lines.append(f"Закончились: {campaign_stats['state_ended']}")
+                # main_lines.append("")
+                # main_lines.append("По модерации:")
+                # main_lines.append(f"Черновики: {campaign_stats['status_draft']}")
+                # main_lines.append(f"На модерации: {campaign_stats['status_moderation']}")
+                # main_lines.append(f"Приняты модерацией: {campaign_stats['status_accepted']} (Хотя бы одно объявление в кампании)")
+                main_lines.append(f"Отклонены модерацией: {campaign_stats['status_rejected']}")
                 main_lines.append("")
                 if total_critical_ads > 0:
                     main_lines.append("❌ Критические ошибки найдены")
