@@ -666,15 +666,14 @@ def main(argv: List[str]) -> int:
                     else:
                         group_other[camp_id].append((ad_id, url, status_code, desc, stub))
 
-            # Критические: заглушки + 404 + "код не получен"
-            critical_campaign_ids: Set[int] = (
-                set(group_stub.keys()) | set(group_404.keys()) | set(group_no_code.keys())
-            )
+            # Основной чат: только заглушки + 404
+            critical_campaign_ids: Set[int] = set(group_stub.keys()) | set(group_404.keys())
+
             total_critical_campaigns = len(critical_campaign_ids)
+
             total_critical_ads = (
-                sum(len(v) for v in group_stub.values())
-                + sum(len(v) for v in group_404.values())
-                + sum(len(v) for v in group_no_code.values())
+                    sum(len(v) for v in group_stub.values())
+                    + sum(len(v) for v in group_404.values())
             )
 
             # Прочие коды HTTP
@@ -687,7 +686,7 @@ def main(argv: List[str]) -> int:
                 main_lines: List[str] = []
                 main_lines.append(f"✨ Отчёт проверки ссылок — {now_str}")
                 main_lines.append("")
-                if total_critical_ads > 0 or issues_api:
+                if total_critical_ads > 0:
                     main_lines.append("❌ Критические ошибки найдены")
                 else:
                     main_lines.append("🟢 Критических ошибок не найдено")
@@ -715,22 +714,22 @@ def main(argv: List[str]) -> int:
                             )
                         main_lines.append("")
 
-                if group_no_code:
-                    main_lines.append("⚪ Код не получен (проверьте вручную):")
-                    for camp_id, problems in sorted(group_no_code.items()):
-                        camp_title = format_campaign_with_name(camp_id, campaign_names)
-                        main_lines.append(f"- {camp_title}:")
-                        for ad_id, url, status_code, desc, _stub in problems:
-                            text_err = desc or "код не получен, проверьте вручную"
-                            main_lines.append(f"  • Объявление {ad_id}: ссылка {url} — {text_err}.")
-                        main_lines.append("")
+                # if group_no_code:
+                #     main_lines.append("⚪ Код не получен (проверьте вручную):")
+                #     for camp_id, problems in sorted(group_no_code.items()):
+                #         camp_title = format_campaign_with_name(camp_id, campaign_names)
+                #         main_lines.append(f"- {camp_title}:")
+                #         for ad_id, url, status_code, desc, _stub in problems:
+                #             text_err = desc or "код не получен, проверьте вручную"
+                #             main_lines.append(f"  • Объявление {ad_id}: ссылка {url} — {text_err}.")
+                #         main_lines.append("")
 
-                if issues_api:
-                    main_lines.append("⚠ Ошибки API Яндекс.Директа:")
-                    for camp_id, err in sorted(issues_api.items()):
-                        camp_title = format_campaign_with_name(camp_id, campaign_names)
-                        main_lines.append(f"- {camp_title}: {err}")
-                    main_lines.append("")
+                # if issues_api:
+                #     main_lines.append("⚠ Ошибки API Яндекс.Директа:")
+                #     for camp_id, err in sorted(issues_api.items()):
+                #         camp_title = format_campaign_with_name(camp_id, campaign_names)
+                #         main_lines.append(f"- {camp_title}: {err}")
+                #     main_lines.append("")
 
                 main_lines.append(f"📄 Полный лог: {os.path.basename(args.output_file)}")
 
@@ -798,6 +797,52 @@ def main(argv: List[str]) -> int:
                     print(f"Дополнительный отчёт отправлен в Telegram ({len(parts)} частей).")
                 else:
                     print("Не удалось отправить дополнительный отчёт в Telegram, см. сообщение об ошибке выше.")
+
+            # --- 2.1. Доп. сообщение: код не получен (только в твой чат) ---
+            if group_no_code and detail_chat_id:
+                no_code_lines: List[str] = []
+                no_code_lines.append("Доп. детали: код не получен.")
+                no_code_lines.append("")
+                no_code_lines.append("⚪ Код не получен (проверьте вручную):")
+                no_code_lines.append(f"📂 Кампаний с такими ошибками: {len(group_no_code)}")
+                no_code_lines.append(
+                    f"📣 Объявлений с такими ошибками: {sum(len(v) for v in group_no_code.values())}"
+                )
+                no_code_lines.append("")
+
+                for camp_id, problems in sorted(group_no_code.items()):
+                    camp_title = format_campaign_with_name(camp_id, campaign_names)
+                    no_code_lines.append(f"- {camp_title}:")
+                    for ad_id, url, status_code, desc, _stub in problems:
+                        text_err = desc or "код не получен, проверьте вручную"
+                        no_code_lines.append(
+                            f"  • Объявление {ad_id}: ссылка {url} — {text_err}."
+                        )
+                    no_code_lines.append("")
+
+                no_code_text = "\n".join(no_code_lines)
+
+                print("\nДополнительный отчёт (код не получен):")
+                print(no_code_text)
+
+                parts = split_telegram_text(no_code_text)
+
+                all_sent = True
+                for idx, part in enumerate(parts, start=1):
+                    header = f"Код не получен (часть {idx}/{len(parts)})\n"
+                    sent = send_telegram_message(
+                        args.telegram_token,
+                        detail_chat_id,
+                        header + part
+                    )
+                    if not sent:
+                        all_sent = False
+                        break
+
+                if all_sent:
+                    print(f"Отчёт по ошибкам без кода отправлен в Telegram ({len(parts)} частей).")
+                else:
+                    print("Не удалось отправить отчёт по ошибкам без кода в Telegram.")
 
             # --- 3. Лог файлом (только в твой чат) ---
             if detail_chat_id:
