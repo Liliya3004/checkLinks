@@ -3,7 +3,7 @@ import os
 import sys
 from typing import Dict, Iterable, List, Optional, Tuple, Set
 import time
-from collections import defaultdict, Counter
+from collections import defaultdict
 from urllib.parse import urlparse
 
 import requests
@@ -109,12 +109,16 @@ class YandexDirectClient:
         for campaign in result.get("Campaigns", []):
             yield int(campaign["Id"]), campaign.get("Name", "")
 
-
-    def get_campaign_stats(self) -> Dict[str, int]:
+    def get_campaign_stats(self) -> Dict[str, object]:
         """
-        Возвращает статистику по кампаниям:
-        State — текущее состояние показов.
-        Status — результат модерации.
+        Возвращает прикладную статистику по кампаниям.
+
+        Нужно для главного Telegram-отчёта:
+        - всего кампаний;
+        - сколько кампаний реально работают сейчас;
+        - сколько кампаний отклонены модерацией;
+        - сколько кампаний на модерации;
+        - ID и названия кампаний на модерации.
         """
         params = {
             "SelectionCriteria": {},
@@ -122,17 +126,39 @@ class YandexDirectClient:
             "Page": {"Limit": 10000, "Offset": 0},
         }
 
-        states = Counter()
-        statuses = Counter()
         total = 0
+        working_now = 0
+        rejected = 0
+        rejected_campaigns: List[str] = []
+        moderation_now = 0
 
         while True:
             result = self._request("campaigns", "get", params)
 
             for campaign in result.get("Campaigns", []):
                 total += 1
-                states[campaign.get("State", "UNKNOWN")] += 1
-                statuses[campaign.get("Status", "UNKNOWN")] += 1
+
+                campaign_id = int(campaign["Id"])
+                campaign_name = campaign.get("Name", "")
+
+                state = campaign.get("State", "UNKNOWN")
+                status = campaign.get("Status", "UNKNOWN")
+
+                # Работают сейчас — только State == ON
+                if state == "ON":
+                    working_now += 1
+
+                # Отклонены модерацией
+                if status == "REJECTED":
+                    rejected += 1
+
+                    if campaign_name:
+                        rejected_campaigns.append(f"{campaign_id} ({campaign_name})")
+                    else:
+                        rejected_campaigns.append(str(campaign_id))
+
+                if status == "MODERATION":
+                    moderation_now += 1
 
             limited_by = result.get("LimitedBy")
             if limited_by is None:
@@ -142,22 +168,10 @@ class YandexDirectClient:
 
         return {
             "total": total,
-
-            # State
-            "state_on": states["ON"],
-            "state_off": states["OFF"],
-            "state_suspended": states["SUSPENDED"],
-            "state_archived": states["ARCHIVED"],
-            "state_ended": states["ENDED"],
-            "state_converted": states["CONVERTED"],
-            "state_unknown": states["UNKNOWN"],
-
-            # Status
-            "status_draft": statuses["DRAFT"],
-            "status_moderation": statuses["MODERATION"],
-            "status_accepted": statuses["ACCEPTED"],
-            "status_rejected": statuses["REJECTED"],
-            "status_unknown": statuses["UNKNOWN"],
+            "working_now": working_now,
+            "rejected": rejected,
+            "moderation_now": moderation_now,
+            "rejected_campaigns": rejected_campaigns,
         }
 
 
@@ -742,19 +756,16 @@ def main(argv: List[str]) -> int:
 
                 main_lines.append("📊 Статистика кампаний в Яндекс.Директе:")
                 main_lines.append(f"Всего кампаний: {campaign_stats['total']}")
-                # main_lines.append("")
-                # main_lines.append("По состоянию показов:")
-                main_lines.append(f"Активны / показы могут идти: {campaign_stats['state_on']}")
-                # main_lines.append(f"Остановлены владельцем: {campaign_stats['state_suspended']}")
-                # main_lines.append(f"Неактивны: {campaign_stats['state_off']}")
-                # main_lines.append(f"В архиве: {campaign_stats['state_archived']}")
-                # main_lines.append(f"Закончились: {campaign_stats['state_ended']}")
-                # main_lines.append("")
-                # main_lines.append("По модерации:")
-                # main_lines.append(f"Черновики: {campaign_stats['status_draft']}")
-                # main_lines.append(f"На модерации: {campaign_stats['status_moderation']}")
-                # main_lines.append(f"Приняты модерацией: {campaign_stats['status_accepted']} (Хотя бы одно объявление в кампании)")
-                main_lines.append(f"Отклонены модерацией: {campaign_stats['status_rejected']}")
+                main_lines.append(f"Работают сейчас: {campaign_stats['working_now']}")
+                main_lines.append(f"Отклонены модерацией: {campaign_stats['rejected']}")
+                # main_lines.append(f"На модерации: {campaign_stats['moderation_now']}")
+
+                if campaign_stats["rejected_campaigns"]:
+                    main_lines.append("")
+                    main_lines.append("Кампании, отклонённые модерацией:")
+                    for item in campaign_stats["rejected_campaigns"]:
+                        main_lines.append(f"- {item}")
+
                 main_lines.append("")
                 if total_critical_ads > 0:
                     main_lines.append("❌ Критические ошибки найдены")
